@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TikTok LIVE Auto Pin",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Automatically rotates the pinned product on your TikTok Shop LIVE console at a fixed interval (round-robin).",
   "permissions": ["activeTab", "storage", "alarms"],
   "host_permissions": [
@@ -26,6 +26,12 @@
     "128": "icons/icon128.png"
   },
   "content_scripts": [
+    {
+      "matches": ["https://shop.tiktok.com/streamer/*"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["https://shop.tiktok.com/streamer/*"],
       "js": ["content.js"],

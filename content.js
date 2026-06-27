@@ -17,14 +17,6 @@
 (() => {
   "use strict";
 
-  const AID = "253642";
-  const APP = "i18n_ecom_alliance";
-  const BASE = "https://shop.tiktok.com/api/v1/streamer_desktop";
-  const Q =
-    "aid=" + AID +
-    "&app_name=" + APP +
-    "&device_platform=web&user_language=en-US&locale=en-US&page_scene=0";
-
   const STORAGE_KEY = "ttAutoPin";
 
   const state = {
@@ -76,8 +68,40 @@
     } catch (_) {}
   }
 
-  // ---- API helpers ---------------------------------------------------------
-  // room_id is embedded in the dashboard HTML (e.g. ...room_id":"7655...").
+  // ---- bridge to the MAIN-world script (inject.js) -------------------------
+  // The actual API fetches must run in the page's own context (see inject.js),
+  // so we send requests over window.postMessage and await the matching reply.
+  let _seq = 0;
+  const _pending = new Map();
+  window.addEventListener("message", (e) => {
+    if (e.source !== window) return;
+    const d = e.data;
+    if (!d || d.type !== "AUTOPIN_RES") return;
+    const cb = _pending.get(d.reqId);
+    if (cb) {
+      _pending.delete(d.reqId);
+      cb(d);
+    }
+  });
+  function callMain(action, payload, timeoutMs = 20000) {
+    return new Promise((resolve) => {
+      const reqId = "ap_" + ++_seq;
+      const to = setTimeout(() => {
+        if (_pending.has(reqId)) {
+          _pending.delete(reqId);
+          resolve({ ok: false, error: "timeout (main-world bridge not loaded — reload the page)" });
+        }
+      }, timeoutMs);
+      _pending.set(reqId, (d) => {
+        clearTimeout(to);
+        resolve(d);
+      });
+      window.postMessage({ type: "AUTOPIN_REQ", reqId, action, payload }, "*");
+    });
+  }
+
+  // room_id is embedded in the dashboard HTML; the isolated world shares the DOM
+  // so we can read it directly here (used only for the onConsole status check).
   function getRoomId() {
     if (cachedRoom) return cachedRoom;
     try {
@@ -91,47 +115,20 @@
   }
 
   async function apiList() {
-    const r = await fetch(BASE + "/live_product/list?" + Q, {
-      credentials: "include",
-    });
-    const j = await r.json();
-    if (!j || j.code !== 0 || !j.data) throw new Error("list code " + (j && j.code));
-    return (j.data.products || []).map((p, i) => ({
-      id: String(p.product_id),
-      name: p.title || "Product " + (i + 1),
-      slot: i + 1,
-    }));
+    const r = await callMain("list");
+    if (!r.ok) throw new Error(r.error || "list failed");
+    return r.data || [];
   }
 
   async function apiGetPin() {
-    const room = getRoomId();
-    if (!room) return null;
-    try {
-      const r = await fetch(BASE + "/pin/get?room_id=" + room + "&" + Q, {
-        credentials: "include",
-      });
-      const j = await r.json();
-      return j && j.code === 0 && j.product_id ? String(j.product_id) : null;
-    } catch (_) {
-      return null;
-    }
+    const r = await callMain("getPin");
+    return r.ok ? r.data : null;
   }
 
   async function apiPin(productId) {
-    const room = getRoomId();
-    if (!room) return { ok: false, msg: "no room_id (not on a live console?)" };
-    try {
-      const r = await fetch(BASE + "/live_product/pin?" + Q, {
-        method: "POST",
-        credentials: "include",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ room_id: room, product_id: String(productId), op: 1 }),
-      });
-      const j = await r.json().catch(() => ({}));
-      return { ok: j.code === 0, code: j.code, msg: j.message };
-    } catch (e) {
-      return { ok: false, msg: String((e && e.message) || e) };
-    }
+    const r = await callMain("pin", { productId });
+    if (!r.ok) return { ok: false, msg: r.error || "pin failed" };
+    return r.data || { ok: false, msg: "no response" };
   }
 
   // ---- rotation ------------------------------------------------------------
