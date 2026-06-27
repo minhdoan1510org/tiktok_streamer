@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TikTok LIVE Auto Pin</title>
+    <style>
+      :root {
+        --teal: #1a8870;
+        --teal-dark: #136b58;
+        --red: #d4393f;
+        --bg: #ffffff;
+        --muted: #6b7280;
+        --border: #e5e7eb;
+      }
+      * { box-sizing: border-box; }
+      body {
+        width: 300px;
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        color: #111827;
+        background: var(--bg);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--border);
+      }
+      header .dot {
+        width: 10px; height: 10px; border-radius: 50%;
+        background: #c4c4c4; flex: none;
+      }
+      header .dot.on { background: var(--teal); box-shadow: 0 0 0 3px rgba(26,136,112,.18); }
+      header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+      .body { padding: 14px 16px; }
+      label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+      .row { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+      input[type="number"] {
+        flex: 1; padding: 8px 10px; font-size: 14px;
+        border: 1px solid var(--border); border-radius: 8px; outline: none;
+      }
+      input[type="number"]:focus { border-color: var(--teal); }
+      .unit { font-size: 12px; color: var(--muted); }
+      .quick { display: flex; gap: 6px; margin-bottom: 14px; }
+      .quick button {
+        flex: 1; padding: 6px 0; font-size: 12px; cursor: pointer;
+        border: 1px solid var(--border); background: #f9fafb; border-radius: 6px;
+      }
+      .quick button:hover { background: #f1f3f5; }
+      .btns { display: flex; gap: 8px; }
+      button.primary, button.danger {
+        flex: 1; padding: 10px; font-size: 14px; font-weight: 600;
+        border: none; border-radius: 8px; cursor: pointer; color: #fff;
+      }
+      button.primary { background: var(--teal); }
+      button.primary:hover { background: var(--teal-dark); }
+      button.danger { background: var(--red); }
+      button.danger:hover { filter: brightness(.95); }
+      button:disabled { opacity: .45; cursor: not-allowed; }
+      .secondary {
+        width: 100%; margin-top: 8px; padding: 8px; font-size: 13px;
+        background: #fff; border: 1px solid var(--border); border-radius: 8px;
+        cursor: pointer;
+      }
+      .secondary:hover { background: #f9fafb; }
+      .status {
+        margin-top: 14px; padding: 10px 12px; border-radius: 8px;
+        background: #f6f8f7; font-size: 12px; line-height: 1.7; color: #374151;
+      }
+      .status b { color: #111827; }
+      .warn { color: var(--red); font-size: 12px; margin-top: 10px; display: none; }
+
+      .products { margin-top: 4px; margin-bottom: 14px; }
+      .products .head {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 6px;
+      }
+      .products .head label { margin: 0; }
+      .products .actions { display: flex; gap: 10px; }
+      .products .actions a { font-size: 11px; color: var(--teal); cursor: pointer; text-decoration: none; }
+      .products .actions a:hover { text-decoration: underline; }
+      .list {
+        max-height: 180px; overflow-y: auto;
+        border: 1px solid var(--border); border-radius: 8px;
+      }
+      .list .empty { padding: 14px; font-size: 12px; color: var(--muted); text-align: center; }
+      .item {
+        display: flex; align-items: center; gap: 8px;
+        padding: 7px 10px; font-size: 12px; border-bottom: 1px solid #f1f3f5;
+        cursor: pointer;
+      }
+      .item:last-child { border-bottom: none; }
+      .item:hover { background: #f9fafb; }
+      .item input { flex: none; width: 15px; height: 15px; accent-color: var(--teal); }
+      .item .slot {
+        flex: none; min-width: 20px; height: 20px; padding: 0 5px;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: #eef2f1; color: #374151; border-radius: 5px;
+        font-size: 11px; font-weight: 600;
+      }
+      .item .nm { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .item .badge { flex: none; font-size: 10px; color: var(--teal); font-weight: 600; }
+      .loadBtn {
+        width: 100%; margin-bottom: 8px; padding: 8px; font-size: 13px;
+        background: #fff; border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+      }
+      .loadBtn:hover { background: #f9fafb; }
+      .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+      .update-banner {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px;
+        background: #fff4f4;
+        border-bottom: 1px solid #f3d6d7;
+        font-size: 12px;
+        color: #8a2b2f;
+      }
+      .update-banner.show { display: flex; }
+      .update-banner .txt { flex: 1; }
+      .update-banner b { color: #6f181d; }
+      .update-banner a {
+        flex: none;
+        background: var(--red);
+        color: #fff;
+        text-decoration: none;
+        font-weight: 600;
+        padding: 6px 10px;
+        border-radius: 6px;
+      }
+      .update-banner a:hover { filter: brightness(0.95); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="dot" id="dot"></span>
+      <h1>TikTok LIVE Auto Pin</h1>
+    </header>
+    <div class="update-banner" id="updateBanner">
+      <span class="txt">
+        Update available: <b id="updLatest"></b>
+        <span id="updNotes"></span>
+      </span>
+      <a id="updLink" href="#" target="_blank" rel="noopener">Download</a>
+    </div>
+    <div class="body">
+      <label for="interval">Change pin every</label>
+      <div class="row">
+        <input type="number" id="interval" min="5" max="3600" value="10" />
+        <span class="unit">seconds</span>
+      </div>
+      <div class="quick">
+        <button data-sec="10">10s</button>
+        <button data-sec="30">30s</button>
+        <button data-sec="60">1m</button>
+        <button data-sec="120">2m</button>
+      </div>
+
+      <div class="products">
+        <div class="head">
+          <label>Products to rotate</label>
+          <div class="actions">
+            <a id="selAll">All</a>
+            <a id="selNone">None</a>
+          </div>
+        </div>
+        <button class="loadBtn" id="loadBtn">Load products from LIVE</button>
+        <div class="list" id="list">
+          <div class="empty">Click "Load products" to choose which products to pin.</div>
+        </div>
+        <div class="hint" id="selHint"></div>
+      </div>
+
+      <div class="btns">
+        <button class="primary" id="startBtn">Start</button>
+        <button class="danger" id="stopBtn" disabled>Stop</button>
+      </div>
+      <button class="secondary" id="pinNowBtn">Pin next product now</button>
+
+      <div class="status" id="status">Loading…</div>
+      <div class="warn" id="warn">
+        Open the LIVE console (Product dashboard) tab first, then reopen this popup.
+      </div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
