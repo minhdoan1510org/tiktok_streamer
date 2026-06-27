@@ -21,8 +21,8 @@ const updLink = $("updLink");
 let pollTimer = null;
 let intervalSeeded = false; // only fill the input from storage once
 
-let products = []; // [{slot, name, pinned}]
-let selected = new Set(); // chosen slot numbers
+let products = []; // [{id, slot, name, pinned}]
+let selected = new Set(); // chosen product_ids
 
 // find the LIVE console tab (the one the content script runs in)
 async function getLiveTab() {
@@ -53,10 +53,10 @@ function renderProducts() {
     row.className = "item";
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = selected.has(p.slot);
+    cb.checked = selected.has(p.id);
     cb.addEventListener("change", () => {
-      if (cb.checked) selected.add(p.slot);
-      else selected.delete(p.slot);
+      if (cb.checked) selected.add(p.id);
+      else selected.delete(p.id);
       persistSelection();
       updateSelHint();
     });
@@ -111,11 +111,12 @@ async function loadProducts() {
   // default: keep prior selection if any, otherwise select all
   const prior = new Set(resp.selected || []);
   selected = prior.size
-    ? new Set([...prior].filter((s) => products.some((p) => p.slot === s)))
-    : new Set(products.map((p) => p.slot));
+    ? new Set([...prior].filter((id) => products.some((p) => p.id === id)))
+    : new Set(products.map((p) => p.id));
   persistSelection();
   renderProducts();
   if (resp.status) render(resp.status);
+  if (resp.error) statusEl.innerHTML = "API error: <b>" + resp.error + "</b>";
 }
 
 // ---- status ----------------------------------------------------------------
@@ -141,12 +142,13 @@ function render(st) {
     intervalSeeded = true;
   }
 
+  const esc = (s) => String(s).replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
   const lines = [];
   lines.push(`Status: <b>${st.running ? "Running" : "Stopped"}</b>`);
   lines.push(`Rotating: <b>${st.rotationCount || 0}</b> of <b>${st.total || "–"}</b> products`);
-  if (st.pointer) lines.push(`Last pinned slot: <b>#${st.pointer}</b>`);
+  if (st.currentName) lines.push(`Pinned now: <b>${esc(st.currentName.slice(0, 32))}</b>`);
   if (st.running) lines.push(`Next change in: <b>${st.secondsToNext}s</b>`);
-  if (st.lastResult) lines.push(`Last action: <b>${st.lastResult}</b>`);
+  if (st.lastResult) lines.push(`Last action: <b>${esc(st.lastResult)}</b>`);
   statusEl.innerHTML = lines.join("<br>");
 }
 
@@ -175,7 +177,7 @@ pinNowBtn.addEventListener("click", () => withTab({ type: "pinNow" }));
 loadBtn.addEventListener("click", loadProducts);
 
 selAll.addEventListener("click", () => {
-  selected = new Set(products.map((p) => p.slot));
+  selected = new Set(products.map((p) => p.id));
   persistSelection();
   renderProducts();
 });

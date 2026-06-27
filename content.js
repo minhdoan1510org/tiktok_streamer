@@ -1,52 +1,52 @@
-/* TikTok LIVE Auto Pin - content script
+/* TikTok LIVE Auto Pin - content script (API-based)
  *
- * Runs on the LIVE console product dashboard
- * (https://shop.tiktok.com/streamer/live/product/dashboard).
+ * Runs on the LIVE console (https://shop.tiktok.com/streamer/*).
  *
- * The product list is rendered inside a *virtualized* container: only a few
- * rows exist in the DOM at any time, so to reach a given product we must
- * scroll the container until that product's row is rendered.
+ * Instead of scraping the virtualized product list / clicking buttons, this
+ * drives TikTok's own streamer APIs directly (same-origin fetch, uses the
+ * logged-in cookies, no request signing required):
  *
- * Each product row carries a stable "slot number" (the small numbered input
- * box: 1, 2, 3, ...). We use that slot number as the product's identity.
+ *   GET  /api/v1/streamer_desktop/live_product/list   -> products (id, title, order)
+ *   GET  /api/v1/streamer_desktop/pin/get?room_id=..   -> currently pinned product_id
+ *   POST /api/v1/streamer_desktop/live_product/pin     -> {room_id, product_id, op:1}
  *
- * Rotation: round-robin through the user-selected slots (or all products if
- * none are selected). Pinning a product auto-replaces the previously pinned
- * one (TikTok LIVE allows only one pinned product).
+ * room_id is read from the dashboard page's HTML. Rotation = round-robin over
+ * the selected product_ids (or all products if none selected). Pinning a new
+ * product automatically replaces the previous one.
  */
 (() => {
   "use strict";
 
-  const SEL = {
-    // hashed suffix on the class changes between TikTok deploys, so match loosely
-    container: '[class*="virtualized-container"]',
-    pin: ".pc_pin_product_pin", // an unpinned product's "Pin" button
-    unpin: ".pc_pin_product_unpin", // the currently pinned product's "Unpin" button
-    listPin: ".pc_pin_product_list_pin", // bulk Pin in summary - never click for rotation
-  };
+  const AID = "253642";
+  const APP = "i18n_ecom_alliance";
+  const BASE = "https://shop.tiktok.com/api/v1/streamer_desktop";
+  const Q =
+    "aid=" + AID +
+    "&app_name=" + APP +
+    "&device_platform=web&user_language=en-US&locale=en-US&page_scene=0";
 
   const STORAGE_KEY = "ttAutoPin";
 
   const state = {
     running: false,
     intervalSec: 10,
-    selected: [], // slot numbers the user chose; empty = all products
+    selected: [], // chosen product_ids; empty = all products
     idx: -1, // current index within the rotation order
-    pointer: 0, // last slot we pinned (for display)
-    total: 0, // number of products (slots 1..total)
+    currentId: null, // last product_id we pinned
+    products: [], // [{ id, name, slot }] cached from the API
   };
 
   let loopTimer = null;
   let nextFireAt = 0;
   let busy = false;
+  let cachedRoom = null;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const log = (...a) => console.log("[AutoPin]", ...a);
 
   // ---- persistence (per-tab) -----------------------------------------------
-  // We use the page's sessionStorage, which is scoped to THIS tab: other tabs
-  // keep their own independent settings, and the `running` flag is never
-  // restored, so refreshing the tab auto-stops the rotation.
+  // sessionStorage is scoped to THIS tab and survives a refresh, so settings +
+  // run state persist per tab and the rotation auto-resumes after a reload.
   function save() {
     try {
       sessionStorage.setItem(
@@ -54,6 +54,9 @@
         JSON.stringify({
           intervalSec: state.intervalSec,
           selected: state.selected,
+          running: state.running,
+          idx: state.idx,
+          currentId: state.currentId,
         })
       );
     } catch (_) {}
@@ -66,238 +69,108 @@
         const s = JSON.parse(raw);
         state.intervalSec = s.intervalSec || 10;
         state.selected = Array.isArray(s.selected) ? s.selected : [];
+        state.running = !!s.running;
+        state.idx = typeof s.idx === "number" ? s.idx : -1;
+        state.currentId = s.currentId || null;
       }
     } catch (_) {}
-    // Always start stopped after a (re)load -> auto-stop on tab refresh.
-    state.running = false;
-    state.idx = -1;
-    state.pointer = 0;
   }
 
-  // ---- DOM helpers ---------------------------------------------------------
-  function getContainer() {
-    return document.querySelector(SEL.container);
-  }
-
-  // The virtualized rows are the direct children of the inner spacer element.
-  // Walk up from a Pin/Unpin button to that row element so we capture the WHOLE
-  // row (the slot-number box lives in a separate left column from the price).
-  function rowOf(btn) {
-    const container = getContainer();
-    const inner = container && (container.children[0] || container);
-    let el = btn;
-    while (el && el.parentElement && el.parentElement !== inner) {
-      el = el.parentElement;
-    }
-    return el && el.parentElement === inner ? el : btn.closest("div") || btn;
-  }
-
-  // Walk up from a Pin/Unpin button to the product "card" element
-  // (the smallest ancestor that contains the price + stock text) - used for the
-  // product NAME only (it excludes the filter bar in the pinned top block).
-  function cardOf(btn) {
-    let el = btn;
-    for (let i = 0; i < 14 && el; i++) {
-      const t = el.textContent || "";
-      if (/Stock/i.test(t) && /đ|₫/.test(t) && t.length < 400) return el;
-      el = el.parentElement;
-    }
-    return btn.closest("div") || btn;
-  }
-
-  // Extract a readable product title from a card.
-  function nameOf(card) {
-    let t = (card.textContent || "").replace(/\s+/g, " ").trim();
-    // cut everything from the price / stock onward
-    t = t.split(/\s*\d[\d.,]*\s*(?:đ|₫)/)[0];
-    t = t.split(/Stock/i)[0];
-    t = t.replace(/Hot deals/gi, "").trim();
-    return t.slice(0, 80) || "(unnamed)";
-  }
-
-  // Read the slot number from a row. Unpinned product rows have exactly one
-  // small numbered input; the pinned product (top block) has filter/search
-  // inputs, so we only trust the slot for rows whose button is a "Pin" button.
-  function slotOfRow(row) {
-    const inp = row.querySelector('input[type="number"]') || row.querySelector("input");
-    if (inp && inp.value !== "") {
-      const v = parseInt(inp.value, 10);
-      if (!isNaN(v)) return v;
-    }
-    return null;
-  }
-
-  // returns the rendered row for a given slot, or null if not rendered
-  function findRenderedCard(slot) {
-    const container = getContainer();
-    if (!container) return null;
-    const inner = container.children[0] || container;
-    for (const block of inner.children) {
-      const btn = block.querySelector(SEL.pin);
-      if (!btn) continue; // only unpinned rows can be pinned (and carry a slot)
-      const row = rowOf(btn);
-      if (slotOfRow(row) === slot) return { card: row, btn };
-    }
-    return null;
-  }
-
-  // Scroll the virtualized list and build the full product catalog:
-  // [{ slot, name, pinned }] sorted by slot. The currently pinned product has
-  // no slot input, so we infer its slot from the gap in 1..max.
-  async function scanProducts() {
-    const container = getContainer();
-    if (!container) return [];
-    const inner = container.children[0] || container;
-
-    const bySlot = new Map(); // slot -> name
-    let pinnedName = null;
-
-    const collect = () => {
-      for (const block of inner.children) {
-        const btn = block.querySelector(`${SEL.pin}, ${SEL.unpin}`);
-        if (!btn) continue;
-        const isPinned = btn.classList.contains("pc_pin_product_unpin");
-        if (isPinned) {
-          if (!pinnedName) pinnedName = nameOf(cardOf(btn));
-          continue;
-        }
-        const slot = slotOfRow(rowOf(btn));
-        if (slot != null && !bySlot.has(slot)) {
-          bySlot.set(slot, nameOf(cardOf(btn)));
-        }
-      }
-    };
-
-    const orig = container.scrollTop;
-    collect();
-    for (let pos = 0; pos <= container.scrollHeight; pos += 250) {
-      container.scrollTop = pos;
-      await sleep(110);
-      collect();
-    }
-    container.scrollTop = orig;
-    await sleep(80);
-
-    const present = [...bySlot.keys()];
-    let max = present.length ? Math.max(...present) : 0;
-
-    // infer the pinned product's slot (the missing number in 1..max)
-    let pinnedSlot = null;
-    for (let i = 1; i <= max; i++) {
-      if (!bySlot.has(i)) {
-        pinnedSlot = i;
-        break;
-      }
-    }
-    if (pinnedSlot == null && pinnedName) {
-      // pinned product is beyond current max (e.g. only one product)
-      pinnedSlot = max + 1;
-      max = pinnedSlot;
-    }
-    if (pinnedSlot != null) {
-      bySlot.set(pinnedSlot, pinnedName || `Product #${pinnedSlot}`);
-    }
-
-    return [...bySlot.entries()]
-      .map(([slot, name]) => ({ slot, name, pinned: slot === pinnedSlot }))
-      .sort((a, b) => a.slot - b.slot);
-  }
-
-  // dismiss a confirmation modal if TikTok shows one after clicking Pin.
-  function confirmModalIfAny() {
-    const modal = document.querySelector(
-      ".arco-modal, [class*='modal-content'], [role='dialog']"
-    );
-    if (!modal) return false;
-    const buttons = [...modal.querySelectorAll("button")];
-    const ok = buttons.find((b) =>
-      /^(confirm|ok|pin|yes|đồng ý|xác nhận|có)$/i.test(
-        (b.textContent || "").trim()
-      )
-    );
-    if (ok) {
-      ok.click();
-      return true;
-    }
-    return false;
-  }
-
-  // Pin the product at the given slot.
-  // Returns: "pinned" | "already" | "not-found" | "no-container"
-  async function pinSlot(slot) {
-    const container = getContainer();
-    if (!container) return "no-container";
-
-    let hit = findRenderedCard(slot);
-    if (!hit) {
-      for (let pos = 0; pos <= container.scrollHeight; pos += 220) {
-        container.scrollTop = pos;
-        await sleep(110);
-        hit = findRenderedCard(slot);
-        if (hit) break;
-      }
-    }
-    // Not found: the slot is most likely the one already pinned (pinned product
-    // is lifted into a top block without a slot number).
-    if (!hit) return "not-found";
-
+  // ---- API helpers ---------------------------------------------------------
+  // room_id is embedded in the dashboard HTML (e.g. ...room_id":"7655...").
+  function getRoomId() {
+    if (cachedRoom) return cachedRoom;
     try {
-      hit.card.scrollIntoView({ block: "center" });
-    } catch (_) {}
-    await sleep(180);
-
-    const pinBtn = hit.card.querySelector(SEL.pin);
-    if (!pinBtn) return "already"; // showing "Unpin" -> already pinned
-    pinBtn.click();
-    await sleep(250);
-    confirmModalIfAny();
-    await sleep(150);
-    container.scrollTop = 0;
-    return "pinned";
+      const html = document.documentElement.innerHTML;
+      const m = html.match(/room_id[\\"'\s:=]{1,8}(\d{15,25})/);
+      cachedRoom = m ? m[1] : null;
+    } catch (_) {
+      cachedRoom = null;
+    }
+    return cachedRoom;
   }
 
-  // ---- rotation loop -------------------------------------------------------
-  // The slots to rotate through, in order.
-  function rotationOrder() {
-    if (state.selected && state.selected.length) {
-      return state.selected.slice().sort((a, b) => a - b);
+  async function apiList() {
+    const r = await fetch(BASE + "/live_product/list?" + Q, {
+      credentials: "include",
+    });
+    const j = await r.json();
+    if (!j || j.code !== 0 || !j.data) throw new Error("list code " + (j && j.code));
+    return (j.data.products || []).map((p, i) => ({
+      id: String(p.product_id),
+      name: p.title || "Product " + (i + 1),
+      slot: i + 1,
+    }));
+  }
+
+  async function apiGetPin() {
+    const room = getRoomId();
+    if (!room) return null;
+    try {
+      const r = await fetch(BASE + "/pin/get?room_id=" + room + "&" + Q, {
+        credentials: "include",
+      });
+      const j = await r.json();
+      return j && j.code === 0 && j.product_id ? String(j.product_id) : null;
+    } catch (_) {
+      return null;
     }
-    const all = [];
-    for (let i = 1; i <= state.total; i++) all.push(i);
-    return all;
+  }
+
+  async function apiPin(productId) {
+    const room = getRoomId();
+    if (!room) return { ok: false, msg: "no room_id (not on a live console?)" };
+    try {
+      const r = await fetch(BASE + "/live_product/pin?" + Q, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ room_id: room, product_id: String(productId), op: 1 }),
+      });
+      const j = await r.json().catch(() => ({}));
+      return { ok: j.code === 0, code: j.code, msg: j.message };
+    } catch (e) {
+      return { ok: false, msg: String((e && e.message) || e) };
+    }
+  }
+
+  // ---- rotation ------------------------------------------------------------
+  // product_ids to rotate, kept in the catalog's display order.
+  function rotationOrder() {
+    const ids = state.products.map((p) => p.id);
+    if (state.selected && state.selected.length) {
+      return ids.filter((id) => state.selected.includes(id));
+    }
+    return ids;
   }
 
   async function tick() {
     if (!state.running || busy) return;
     busy = true;
     try {
-      if (!getContainer()) {
-        log("product list not found (are you on the LIVE console?)");
-        return;
+      // refresh the catalog at the start of each full cycle (and first run) so
+      // added/removed/reordered products are picked up.
+      if (!state.products.length || state.idx < 0) {
+        try {
+          state.products = await apiList();
+        } catch (e) {
+          log("list failed:", e.message);
+        }
       }
-      if (!state.total) {
-        const prods = await scanProducts();
-        state.total = prods.length ? Math.max(...prods.map((p) => p.slot)) : 0;
-        log("discovered", state.total, "products");
-      }
-
       const order = rotationOrder();
       if (!order.length) {
         log("no products to rotate");
         return;
       }
-
-      let result = "not-found";
-      for (let attempt = 0; attempt < order.length; attempt++) {
-        state.idx = (state.idx + 1) % order.length;
-        const slot = order[state.idx];
-        result = await pinSlot(slot);
-        log("pin slot", slot, "->", result);
-        if (result === "pinned") {
-          state.pointer = slot;
-          break;
-        }
-        // "already"/"not-found" -> that slot is the currently pinned one; skip
+      state.idx = (state.idx + 1) % order.length;
+      const id = order[state.idx];
+      const res = await apiPin(id);
+      log("pin", id, res);
+      if (res.ok) state.currentId = id;
+      // when we wrap around, force a catalog refresh next cycle
+      if (state.idx >= order.length - 1) {
+        // refresh on next tick
+        setTimeout(() => { state.products = []; }, 0);
       }
       save();
     } catch (e) {
@@ -319,9 +192,10 @@
     if (intervalSec && intervalSec > 0) state.intervalSec = intervalSec;
     if (Array.isArray(selected)) state.selected = selected;
     state.running = true;
-    state.idx = -1; // restart rotation from the beginning of the selection
+    state.idx = -1; // restart from the beginning of the selection
+    state.products = []; // force a fresh catalog
     save();
-    log("started, interval", state.intervalSec, "s, selected", state.selected);
+    log("started, interval", state.intervalSec, "s, selected", state.selected.length || "all");
     clearTimeout(loopTimer);
     busy = false;
     await tick();
@@ -336,17 +210,19 @@
   }
 
   function status() {
+    const cur = state.products.find((p) => p.id === state.currentId);
     return {
       running: state.running,
       intervalSec: state.intervalSec,
       selected: state.selected,
-      pointer: state.pointer,
-      total: state.total,
+      total: state.products.length,
       rotationCount: rotationOrder().length,
+      currentId: state.currentId,
+      currentName: cur ? cur.name : null,
       secondsToNext: state.running
         ? Math.max(0, Math.round((nextFireAt - Date.now()) / 1000))
         : 0,
-      onConsole: !!getContainer(),
+      onConsole: !!getRoomId(),
     };
   }
 
@@ -355,9 +231,8 @@
     if (!msg || !msg.type) return;
     switch (msg.type) {
       case "start":
-        start(msg.intervalSec, msg.selected);
-        sendResponse(status());
-        break;
+        start(msg.intervalSec, msg.selected).then(() => sendResponse(status()));
+        return true;
       case "stop":
         stop();
         sendResponse(status());
@@ -367,12 +242,25 @@
         break;
       case "listProducts":
         (async () => {
-          const products = await scanProducts();
-          state.total = products.length
-            ? Math.max(...products.map((p) => p.slot))
-            : 0;
-          save();
-          sendResponse({ products, selected: state.selected, status: status() });
+          try {
+            state.products = await apiList();
+            const pinned = await apiGetPin();
+            if (pinned) state.currentId = state.currentId || pinned;
+            const products = state.products.map((p) => ({
+              id: p.id,
+              name: p.name,
+              slot: p.slot,
+              pinned: p.id === pinned,
+            }));
+            sendResponse({ products, selected: state.selected, status: status() });
+          } catch (e) {
+            sendResponse({
+              products: [],
+              selected: state.selected,
+              status: status(),
+              error: String((e && e.message) || e),
+            });
+          }
         })();
         return true;
       case "setSelection":
@@ -382,24 +270,18 @@
         break;
       case "pinNow":
         (async () => {
-          if (!state.total) {
-            const prods = await scanProducts();
-            state.total = prods.length
-              ? Math.max(...prods.map((p) => p.slot))
-              : 0;
-          }
-          const order = rotationOrder();
-          let r = "not-found";
-          for (let attempt = 0; attempt < order.length; attempt++) {
+          try {
+            if (!state.products.length) state.products = await apiList();
+            const order = rotationOrder();
+            if (!order.length) return sendResponse({ ...status(), lastResult: "no products" });
             state.idx = (state.idx + 1) % order.length;
-            r = await pinSlot(order[state.idx]);
-            if (r === "pinned") {
-              state.pointer = order[state.idx];
-              break;
-            }
+            const res = await apiPin(order[state.idx]);
+            if (res.ok) state.currentId = order[state.idx];
+            save();
+            sendResponse({ ...status(), lastResult: res.ok ? "pinned" : "fail: " + res.msg });
+          } catch (e) {
+            sendResponse({ ...status(), lastResult: "error: " + ((e && e.message) || e) });
           }
-          save();
-          sendResponse({ ...status(), lastResult: r });
         })();
         return true;
       default:
@@ -409,9 +291,20 @@
   });
 
   // ---- init ----------------------------------------------------------------
-  // Load this tab's saved settings (interval + selection). Rotation stays
-  // stopped until the user presses Start, including after a tab refresh.
   load();
 
-  log("content script ready (stopped; per-tab settings loaded)");
+  async function resumeIfRunning() {
+    if (!state.running) return;
+    log("resuming after refresh…");
+    // wait until room_id is available in the page (SPA may render late)
+    for (let i = 0; i < 30 && !getRoomId(); i++) await sleep(500);
+    if (state.running) tick();
+  }
+  resumeIfRunning();
+
+  log(
+    "content script ready (API mode, " +
+      (state.running ? "resuming" : "stopped") +
+      ")"
+  );
 })();

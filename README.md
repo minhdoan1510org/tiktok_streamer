@@ -40,32 +40,36 @@ close the popup.
 
 **Per-tab & refresh behavior:**
 
-- Settings (interval + product selection) are saved **per tab** (in that tab's
-  `sessionStorage`). Two LIVE tabs run independently and don't affect each other.
-- **Refreshing the tab auto-stops** the rotation (your saved interval/selection
-  are kept, but you must press **Start** again). This is intentional, so a reload
-  never keeps pinning unexpectedly.
+- Settings + run state are saved **per tab** (in that tab's `sessionStorage`).
+  Two LIVE tabs run independently and don't affect each other.
+- **Refreshing the tab auto-resumes**: if rotation was running, it continues
+  after the page reloads (with the same interval, product selection, and
+  position) once the product list has rendered. State is cleared only when the
+  tab is closed.
 
 ---
 
 ## How it works
 
-- The product list is a **virtualized list** (only a few rows exist in the DOM
-  at once), so the extension scrolls the list to bring a target product's row
-  into view before clicking its **Pin** button.
-- Each product row has a stable **slot number** (the small numbered box). The
-  extension uses that as the product's identity and rotates slots `1..N`.
+The extension drives TikTok's own streamer APIs directly (same-origin `fetch`
+using your logged-in cookies — no request signing required), instead of scraping
+the virtualized DOM. This is fast, language-independent, and reliable.
+
+| Purpose            | Endpoint                                             | Notes                                   |
+| ------------------ | --------------------------------------------------- | --------------------------------------- |
+| List products      | `GET /api/v1/streamer_desktop/live_product/list`    | returns `data.products[]` in slot order |
+| Current pinned     | `GET /api/v1/streamer_desktop/pin/get?room_id=…`    | returns the pinned `product_id`         |
+| Pin a product      | `POST /api/v1/streamer_desktop/live_product/pin`    | body `{room_id, product_id, op:1}`      |
+
+- `room_id` is read from the dashboard page's HTML.
+- Each product is identified by its stable `product_id`; rotation round-robins
+  over the selected ids (or all products if none selected).
 - Pinning a product automatically replaces the previously pinned one (TikTok
   LIVE allows only one pinned product at a time).
 
-### Selectors used (content.js)
-
-| Purpose                    | Selector                          |
-| -------------------------- | --------------------------------- |
-| Virtualized list container | `[class*="virtualized-container"]` |
-| Pin button (a product)     | `.pc_pin_product_pin`             |
-| Unpin button (pinned one)  | `.pc_pin_product_unpin`           |
-| Slot number                | row's `<input>` value             |
+> If TikTok changes these endpoints, the picker will show an "API error" and
+> nothing will pin — check the `[AutoPin]` logs in the LIVE page DevTools
+> console and update the endpoint paths / params in `content.js`.
 
 ---
 
